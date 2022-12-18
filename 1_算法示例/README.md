@@ -6,4 +6,4 @@
 2. 在命令行里输入 `cd 1_算法示例` 并按 `ENTER` 进入"算法示例"目录。
 3. 在命令行里输入 `python solution.py` 按 `ENTER` 运行示例程序。
 
-实体分类示例代码：solution.py      链接预测示例代码：link.py
+实体分类示例代码：solution.py       链接预测示例代码：link.py
