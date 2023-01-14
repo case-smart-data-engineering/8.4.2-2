@@ -86,20 +86,9 @@ class RGCNLayer(nn.Module):
         if self.is_input_layer:
             # 如果是输入层，需要获得节点的embedding表达
             def message_func(edges):
-                # for input layer, matrix multiply can be converted to be
-                # an embedding lookup using source node id
-                # 就这个例子来说，weight: num_rels * in_feat * out_feat = 91 * 8285 * 16
-                embed = weight.view(-1, self.out_feat) # embed = 753935 * 16
-                # 这句话真的看了半天才懂一点点
-                # edges.data['rel_type']存的是所有的关系 共65439个关系
-                # self.in_feat是输入的embedding，因为这里直接one-hot表示，因此大小为8285
-                # edges.src['id']是每个关系的源节点id, 这个参数看了好久也不知道是怎么来的，我感觉可能是节点有了“id”，然后传进来便就会有这个参数了吧
-                # 这个index还是很奇妙的
-                # 因为一共91种关系，8285个节点，那么最开始输入需要赋值节点自身的特征
-                # 那么每个节点对应的91种关系都有不同的表达
-                # edges.data['rel_type'] * self.in_feat + edges.src['id']就是取自身节点对应的关系的那种表达
-                # 从而获得节点的embedding表达
+                embed = weight.view(-1, self.out_feat) 
                 index = edges.data['rel_type'] * self.in_feat + edges.src['id']
+                # edges.data['rel_type'] * self.in_feat + edges.src['id']就是取自身节点对应的关系的那种表达
                 return {'msg': embed[index] * edges.data['norm']}
         else:
             # 如果不是输入层那么用计算出 邻居特征*关系 的特征值
