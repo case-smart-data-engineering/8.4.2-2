@@ -95,7 +95,7 @@ class RGCNLayer(nn.Module):
             def message_func(edges):
                 # 取出对应关系的权重矩阵
                 w = weight[edges.data['rel_type'].long()]
-                # 矩阵乘法获取每条边需要传递的特征msg:(65439 * 4)
+                # 矩阵乘法获取每条边需要传递的特征msg
                 msg = torch.bmm(edges.src['h'].unsqueeze(1), w).squeeze()
                 msg = msg * edges.data['norm']
                 return {'msg': msg}
@@ -143,7 +143,7 @@ class Model(nn.Module):
         h2o = self.build_output_layer()
         self.layers.append(h2o)
 
-    # 初始胡化每个节点的特征
+    # 初始化每个节点的特征
     def create_features(self):
         features = torch.arange(self.num_nodes)
         return features
