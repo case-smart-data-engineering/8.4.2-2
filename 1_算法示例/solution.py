@@ -1,231 +1,277 @@
 #!/usr/bin/env python3
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dgl import DGLGraph
-import dgl.function as fn
-from functools import partial
+import dgl
+from dgl.data.knowledge_graph import FB15k237Dataset
+from dgl.dataloading import GraphDataLoader
+from dgl.nn.pytorch import RelGraphConv
+import tqdm
 
+# for building training/testing graphs
+def get_subset_g(g, mask, num_rels, bidirected=False):
+    src, dst = g.edges()
+    sub_src = src[mask]
+    sub_dst = dst[mask]
+    sub_rel = g.edata['etype'][mask]
 
-class RGCNLayer(nn.Module):
-    def __init__(self, in_feat, out_feat, num_rels, num_bases=-1, bias=None,
-                 activation=None, is_input_layer=False):
-        super(RGCNLayer, self).__init__()
-        # 输入的特征维度
-        self.in_feat = in_feat
-        # 输出的特征维度
-        self.out_feat = out_feat
-        # 关系的数量
+    if bidirected:
+        sub_src, sub_dst = torch.cat([sub_src, sub_dst]), torch.cat([sub_dst, sub_src])
+        sub_rel = torch.cat([sub_rel, sub_rel + num_rels])
+
+    sub_g = dgl.graph((sub_src, sub_dst), num_nodes=g.num_nodes())
+    sub_g.edata[dgl.ETYPE] = sub_rel
+    return sub_g
+
+class GlobalUniform:
+    def __init__(self, g, sample_size):
+        self.sample_size = sample_size
+        self.eids = np.arange(g.num_edges())
+
+    def sample(self):
+        return torch.from_numpy(np.random.choice(self.eids, self.sample_size))
+
+class NegativeSampler:
+    def __init__(self, k=10): # negative sampling rate = 10
+        self.k = k
+
+    def sample(self, pos_samples, num_nodes):
+        batch_size = len(pos_samples)
+        neg_batch_size = batch_size * self.k
+        neg_samples = np.tile(pos_samples, (self.k, 1))
+
+        values = np.random.randint(num_nodes, size=neg_batch_size)
+        choices = np.random.uniform(size=neg_batch_size)
+        subj = choices > 0.5
+        obj = choices <= 0.5
+        neg_samples[subj, 0] = values[subj]
+        neg_samples[obj, 2] = values[obj]
+        samples = np.concatenate((pos_samples, neg_samples))
+
+        # binary labels indicating positive and negative samples
+        labels = np.zeros(batch_size * (self.k + 1), dtype=np.float32)
+        labels[:batch_size] = 1
+
+        return torch.from_numpy(samples), torch.from_numpy(labels)
+
+class SubgraphIterator:
+    def __init__(self, g, num_rels, sample_size=30000, num_epochs=6000):
+        self.g = g
         self.num_rels = num_rels
-        # 基分解中W_r分解的数量，即B的大小
-        self.num_bases = num_bases
-        # 是否带偏置b
-        self.bias = bias
-        # 激活函数
-        self.activation = activation
-        # 是否是输入层
-        self.is_input_layer = is_input_layer
+        self.sample_size = sample_size
+        self.num_epochs = num_epochs
+        self.pos_sampler = GlobalUniform(g, sample_size)
+        self.neg_sampler = NegativeSampler()
 
-        # 如果说没设定W_r的个数（B）或者W_r的个数比关系数大，那么就直接取关系数
-        # 因为这个正则化就是为了解决关系数过多而导致训练参数过多及过拟合的问题的
-        # 如果没有正则化优化正常来说有几个关系就对应几个W_r
-        # 因为因此肯定是B <= num_rels的
-        if self.num_bases <= 0 or self.num_bases > self.num_rels:
-            self.num_bases = self.num_rels
+    def __len__(self):
+        return self.num_epochs
 
-        # 创建基分解矩阵num_bases * in_feat * out_feat， 对应公式3
-        self.weight = nn.Parameter(torch.Tensor(self.num_bases, self.in_feat,
-                                                self.out_feat))
-        if self.num_bases < self.num_rels:
-            # 如果B小于关系数，那么就需要进行一个维度变换，
-            # 关系数变成成B的数量才可以进行后续计算
-            # 对应公式3
-            self.w_comp = nn.Parameter(torch.Tensor(self.num_rels, self.num_bases))
+    def __getitem__(self, i):
+        eids = self.pos_sampler.sample()
+        src, dst = self.g.find_edges(eids)
+        src, dst = src.numpy(), dst.numpy()
+        rel = self.g.edata[dgl.ETYPE][eids].numpy()
 
-        # 如果需要偏置则添加偏置b
-        if self.bias:
-            self.bias = nn.Parameter(torch.Tensor(out_feat))
+        # relabel nodes to have consecutive node IDs
+        uniq_v, edges = np.unique((src, dst), return_inverse=True)
+        num_nodes = len(uniq_v)
+        # edges is the concatenation of src, dst with relabeled ID
+        src, dst = np.reshape(edges, (2, -1))
+        relabeled_data = np.stack((src, rel, dst)).transpose()
 
-        # 初始化参数
-        nn.init.xavier_uniform_(self.weight,
+        samples, labels = self.neg_sampler.sample(relabeled_data, num_nodes)
+
+        # use only half of the positive edges
+        chosen_ids = np.random.choice(np.arange(self.sample_size),
+                                      size=int(self.sample_size / 2),
+                                      replace=False)
+        src = src[chosen_ids]
+        dst = dst[chosen_ids]
+        rel = rel[chosen_ids]
+        src, dst = np.concatenate((src, dst)), np.concatenate((dst, src))
+        rel = np.concatenate((rel, rel + self.num_rels))
+        sub_g = dgl.graph((src, dst), num_nodes=num_nodes)
+        sub_g.edata[dgl.ETYPE] = torch.from_numpy(rel)
+        sub_g.edata['norm'] = dgl.norm_by_dst(sub_g).unsqueeze(-1)
+        uniq_v = torch.from_numpy(uniq_v).view(-1).long()
+
+        return sub_g, uniq_v, samples, labels
+
+class RGCN(nn.Module):
+    def __init__(self, num_nodes, h_dim, num_rels):
+        super().__init__()
+        # two-layer RGCN
+        self.emb = nn.Embedding(num_nodes, h_dim)
+        self.conv1 = RelGraphConv(h_dim, h_dim, num_rels, regularizer='bdd',
+                                  num_bases=100, self_loop=True)
+        self.conv2 = RelGraphConv(h_dim, h_dim, num_rels, regularizer='bdd',
+                                  num_bases=100, self_loop=True)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, g, nids):
+        x = self.emb(nids)
+        h = F.relu(self.conv1(g, x, g.edata[dgl.ETYPE], g.edata['norm']))
+        h = self.dropout(h)
+        h = self.conv2(g, h, g.edata[dgl.ETYPE], g.edata['norm'])
+        return self.dropout(h)
+
+class LinkPredict(nn.Module):
+    def __init__(self, num_nodes, num_rels, h_dim = 500, reg_param=0.01):
+        super().__init__()
+        self.rgcn = RGCN(num_nodes, h_dim, num_rels * 2)
+        self.reg_param = reg_param
+        self.w_relation = nn.Parameter(torch.Tensor(num_rels, h_dim))
+        nn.init.xavier_uniform_(self.w_relation,
                                 gain=nn.init.calculate_gain('relu'))
-        # 初始化参数，如果B<num_rels说明self.w_comp需要使用，
-        # 因此需要初始化，否则如果b = num_rels则不必使用这个来转化
-        # 那也就用不到这个矩阵了
-        if self.num_bases < self.num_rels:
-            nn.init.xavier_uniform_(self.w_comp,
-                                    gain=nn.init.calculate_gain('relu'))
-        # 使用偏置的话也初始化
-        if self.bias:
-            nn.init.xavier_uniform_(self.bias,
-                                    gain=nn.init.calculate_gain('relu'))
 
-    def forward(self, g):
-        # 如果B < 关系数
-        # 那么参数矩阵就需要转换一下
-        if self.num_bases < self.num_rels:
-            # 根据公式3转换权重
-            # weight的维度 = num_bases * in_feat * out_feat --> in_feat * num_bases * out_feat
-            weight = self.weight.view(self.in_feat, self.num_bases, self.out_feat)
-            # w_comp的维度 => num_rels * num_bases
-            # torch.matmul(self.w_comp, weight)
-            # w_comp(num_rels * num_bases)  weight(in_feat * num_bases * out_feat)
-            #                             ||
-            #                             V
-            #              in_feat * num_rels * out_feat
-            # 再经过view操作
-            # weight --> num_rels * in_feat * out_feat
-            weight = torch.matmul(self.w_comp, weight).view(self.num_rels,
-                                                        self.in_feat, self.out_feat)
+    def calc_score(self, embedding, triplets):
+        s = embedding[triplets[:,0]]
+        r = self.w_relation[triplets[:,1]]
+        o = embedding[triplets[:,2]]
+        score = torch.sum(s * r * o, dim=1)
+        return score
+
+    def forward(self, g, nids):
+        return self.rgcn(g, nids)
+
+    def regularization_loss(self, embedding):
+        return torch.mean(embedding.pow(2)) + torch.mean(self.w_relation.pow(2))
+
+    def get_loss(self, embed, triplets, labels):
+        # each row in the triplets is a 3-tuple of (source, relation, destination)
+        score = self.calc_score(embed, triplets)
+        predict_loss = F.binary_cross_entropy_with_logits(score, labels)
+        reg_loss = self.regularization_loss(embed)
+        return predict_loss + self.reg_param * reg_loss
+
+def filter(triplets_to_filter, target_s, target_r, target_o, num_nodes, filter_o=True):
+    """Get candidate heads or tails to score"""
+    target_s, target_r, target_o = int(target_s), int(target_r), int(target_o)
+    # Add the ground truth node first
+    if filter_o:
+        candidate_nodes = [target_o]
+    else:
+        candidate_nodes = [target_s]
+    for e in range(num_nodes):
+        triplet = (target_s, target_r, e) if filter_o else (e, target_r, target_o)
+        # Do not consider a node if it leads to a real triplet
+        if triplet not in triplets_to_filter:
+            candidate_nodes.append(e)
+    return torch.LongTensor(candidate_nodes)
+
+def perturb_and_get_filtered_rank(emb, w, s, r, o, test_size, triplets_to_filter, filter_o=True):
+    """Perturb subject or object in the triplets"""
+    num_nodes = emb.shape[0]
+    ranks = []
+    for idx in tqdm.tqdm(range(test_size), desc="Evaluate"):
+        target_s = s[idx]
+        target_r = r[idx]
+        target_o = o[idx]
+        candidate_nodes = filter(triplets_to_filter, target_s, target_r,
+                                 target_o, num_nodes, filter_o=filter_o)
+        if filter_o:
+            emb_s = emb[target_s]
+            emb_o = emb[candidate_nodes]
         else:
-            # 如果没有正则化，即直接取所有关系，原本初始化就是这个形状
-            # weight = num_rels * in_feat * out_feat
-            weight = self.weight
+            emb_s = emb[candidate_nodes]
+            emb_o = emb[target_o]
+        target_idx = 0
+        emb_r = w[target_r]
+        emb_triplet = emb_s * emb_r * emb_o
+        scores = torch.sigmoid(torch.sum(emb_triplet, dim=1))
 
-        if self.is_input_layer:
-            # 如果是输入层，需要获得节点的embedding表达
-            def message_func(edges):
-                embed = weight.view(-1, self.out_feat) 
-                index = edges.data['rel_type'] * self.in_feat + edges.src['id']
-                # edges.data['rel_type'] * self.in_feat + edges.src['id']就是取自身节点对应的关系的那种表达
-                return {'msg': embed[index] * edges.data['norm']}
-        else:
-            # 如果不是输入层那么用计算出 邻居特征*关系 的特征值
-            def message_func(edges):
-                # 取出对应关系的权重矩阵
-                w = weight[edges.data['rel_type'].long()]
-                # 矩阵乘法获取每条边需要传递的特征msg
-                msg = torch.bmm(edges.src['h'].unsqueeze(1), w).squeeze()
-                msg = msg * edges.data['norm']
-                return {'msg': msg}
-        # msg求和作为节点特征
-        # 有偏置加偏置。
-        # 有激活加激活，主要是用于输出层设置的
-        def apply_func(nodes):
-            h = nodes.data['h']
-            if self.bias:
-                h = h + self.bias
-            if self.activation:
-                h = self.activation(h)
-            return {'h': h}
+        _, indices = torch.sort(scores, descending=True)
+        rank = int((indices == target_idx).nonzero())
+        ranks.append(rank)
+    return torch.LongTensor(ranks)
 
-        g.update_all(message_func, fn.sum(msg='msg', out='h'), apply_func)
+def calc_mrr(emb, w, test_mask, triplets_to_filter, batch_size=100, filter=True):
+    with torch.no_grad():
+        test_triplets = triplets_to_filter[test_mask]
+        s, r, o = test_triplets[:,0], test_triplets[:,1], test_triplets[:,2]
+        test_size = len(s)
+        triplets_to_filter = {tuple(triplet) for triplet in triplets_to_filter.tolist()}
+        ranks_s = perturb_and_get_filtered_rank(emb, w, s, r, o, test_size,
+                                                triplets_to_filter, filter_o=False)
+        ranks_o = perturb_and_get_filtered_rank(emb, w, s, r, o,
+                                                test_size, triplets_to_filter)
+        ranks = torch.cat([ranks_s, ranks_o])
+        ranks += 1 # change to 1-indexed
+        mrr = torch.mean(1.0 / ranks.float()).item()
+        i = 0
+        while i < test_size:
+            print("<", s[i], r[i], o[i], ">")
+            i += 1
+    return mrr
 
+def train(dataloader, test_g, test_nids, test_mask, triplets, device, model_state_file, model):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    best_mrr = 0
+    for epoch, batch_data in enumerate(dataloader): # single graph batch
+        model.train()
+        g, train_nids, edges, labels = batch_data
+        g = g.to(device)
+        train_nids = train_nids.to(device)
+        edges = edges.to(device)
+        labels = labels.to(device)
 
-class Model(nn.Module):
-    def __init__(self, num_nodes, h_dim, out_dim, num_rels,
-                 num_bases=-1, num_hidden_layers=1):
-        super(Model, self).__init__()
-        self.num_nodes = num_nodes
-        self.h_dim = h_dim
-        self.out_dim = out_dim
-        self.num_rels = num_rels
-        self.num_bases = num_bases
-        self.num_hidden_layers = num_hidden_layers
+        embed = model(g, train_nids)
+        loss = model.get_loss(embed, edges, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # clip gradients
+        optimizer.step()
+        print("Epoch {:04d} | Loss {:.4f} | Best MRR {:.4f}".format(epoch, loss.item(), best_mrr))
+        if (epoch + 1) % 500 == 0:
+            # perform validation on CPU because full graph is too large
+            model = model.cpu()
+            model.eval()
+            embed = model(test_g, test_nids)
+            mrr = calc_mrr(embed, model.w_relation, test_mask, triplets,
+                           batch_size=500)
+            # save best model
+            if best_mrr < mrr:
+                best_mrr = mrr
+                torch.save({'state_dict': model.state_dict(), 'epoch': epoch}, model_state_file)
+            model = model.to(device)
 
-        # 创建R-GCN层
-        self.build_model()
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Training with DGL built-in RGCN module')
 
-        # 获取特征
-        self.features = self.create_features()
+    # load and preprocess dataset
+    data = FB15k237Dataset(reverse=False)
+    g = data[0]
+    num_nodes = g.num_nodes()
+    num_rels = data.num_rels
+    train_g = get_subset_g(g, g.edata['train_mask'], num_rels)
+    test_g = get_subset_g(g, g.edata['train_mask'], num_rels, bidirected=True)
+    test_g.edata['norm'] = dgl.norm_by_dst(test_g).unsqueeze(-1)
+    test_nids = torch.arange(0, num_nodes)
+    test_mask = g.edata['test_mask']
+    subg_iter = SubgraphIterator(train_g, num_rels) # uniform edge sampling
+    dataloader = GraphDataLoader(subg_iter, batch_size=1, collate_fn=lambda x: x[0])
 
-    def build_model(self):
-        self.layers = nn.ModuleList()
-        # 输入层
-        i2h = self.build_input_layer()
-        self.layers.append(i2h)
-        # 隐藏层
-        for _ in range(self.num_hidden_layers):
-            h2h = self.build_hidden_layer()
-            self.layers.append(h2h)
-        # 输出层
-        h2o = self.build_output_layer()
-        self.layers.append(h2o)
+    # Prepare data for metric computation
+    src, dst = g.edges()
+    triplets = torch.stack([src, g.edata['etype'], dst], dim=1)
 
-    # 初始化每个节点的特征
-    def create_features(self):
-        features = torch.arange(self.num_nodes)
-        return features
+    # create RGCN model
+    model = LinkPredict(num_nodes, num_rels).to(device)
 
-    # 构建输入层
-    def build_input_layer(self):
-        return RGCNLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
-                         activation=F.relu, is_input_layer=True)
+    # train
+    model_state_file = 'model_state.pth'
+    train(dataloader, test_g, test_nids, test_mask, triplets, device, model_state_file, model)
 
-    # 构建隐藏层
-    def build_hidden_layer(self):
-        return RGCNLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
-                         activation=F.relu)
-    # 构建输出层
-    def build_output_layer(self):
-        return RGCNLayer(self.h_dim, self.out_dim, self.num_rels, self.num_bases,
-                         activation=partial(F.softmax, dim=1))
-    # 前向传播
-    def forward(self, g):
-        if self.features is not None:
-            g.ndata['id'] = self.features
-        for layer in self.layers:
-            layer(g)
-        # 取出每个节点的隐藏层并且删除"h"特征，方便下一次进行训练
-        return g.ndata.pop('h')
-
-
-from dgl.contrib.data import load_data
-data = load_data(dataset='aifb')
-num_nodes = data.num_nodes  # 节点数量
-num_rels = data.num_rels # 关系数量
-num_classes = data.num_classes # 分类的类别数
-labels = data.labels # 标签
-train_idx = data.train_idx  # 训练集节点的index
-# split training and validation set
-val_idx = train_idx[:len(train_idx) // 5] # 划分验证集
-train_idx = train_idx[len(train_idx) // 5:] # 划分训练集
-edge_type = torch.from_numpy(data.edge_type) # 获取边的类型
-edge_norm = torch.from_numpy(data.edge_norm).unsqueeze(1) # 获取边的标准化因子
-
-labels = torch.from_numpy(labels).view(-1)
-
-
-# configurations
-n_hidden = 16 # 每层的神经元个数
-n_bases = -1 # 直接用所有的关系，不正则化
-n_hidden_layers = 0 # 使用一层输入一层输出，不用隐藏层
-n_epochs = 25 # 训练次数
-lr = 0.01 # 学习率
-l2norm = 0
-# 创建图
-g = DGLGraph((data.edge_src, data.edge_dst))
-g.edata.update({'rel_type': edge_type, 'norm': edge_norm})
-
-# 创建模型
-model = Model(g.num_nodes(),
-              n_hidden,
-              num_classes,
-              num_rels,
-              num_bases=n_bases,
-              num_hidden_layers=n_hidden_layers)
-
-
-optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2norm)
-
-print("start training...")
-model.train()
-for epoch in range(n_epochs):
-    optimizer.zero_grad()
-    logits = model.forward(g)
-    loss = F.cross_entropy(logits[train_idx], labels[train_idx].long())
-    loss.backward()
-
-    optimizer.step()
-
-    train_acc = torch.sum(logits[train_idx].argmax(dim=1) == labels[train_idx])
-    train_acc = train_acc.item() / len(train_idx)
-    val_loss = F.cross_entropy(logits[val_idx], labels[val_idx].long())
-    val_acc = torch.sum(logits[val_idx].argmax(dim=1) == labels[val_idx])
-    val_acc = val_acc.item() / len(val_idx)
-    print("Epoch {:05d} | ".format(epoch) +
-          "Train Accuracy: {:.4f} | Train Loss: {:.4f} | ".format(
-              train_acc, loss.item()) +
-          "Validation Accuracy: {:.4f} | Validation loss: {:.4f}".format(
-              val_acc, val_loss.item()))
+    # testing
+    print("Testing...")
+    checkpoint = torch.load(model_state_file)
+    model = model.cpu() # test on CPU
+    model.eval()
+    model.load_state_dict(checkpoint['state_dict'])
+    embed = model(test_g, test_nids)
+    best_mrr = calc_mrr(embed, model.w_relation, test_mask, triplets,
+                        batch_size=500)
+    print("Best MRR {:.4f} achieved using the epoch {:04d}".format(best_mrr, checkpoint['epoch']))
