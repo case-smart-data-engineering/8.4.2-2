@@ -200,10 +200,13 @@ def calc_mrr(emb, w, test_mask, triplets_to_filter, batch_size=100, filter=True)
         ranks = torch.cat([ranks_s, ranks_o])
         ranks += 1 # change to 1-indexed
         mrr = torch.mean(1.0 / ranks.float()).item()
+        doc = open('out_1.txt', 'w')
         i = 0
         while i < test_size:
             print("<", s[i], r[i], o[i], ">")
+            print("<", s[i], r[i], o[i], ">", file=doc)
             i += 1
+        doc.close()
     return mrr
 
 def train(dataloader, test_g, test_nids, test_mask, triplets, device, model_state_file, model):
