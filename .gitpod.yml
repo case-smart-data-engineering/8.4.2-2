@@ -1,7 +1,13 @@
 # List the start up tasks. Learn more https://www.gitpod.io/docs/config-start-tasks/
+# 使用一个带有 Python 3.8 的预构建镜像
+image:
+       gitpod/workspace-full:latest
 tasks:
   - name: "install requirements"
     command: |
+      pip install -U pip
+      pyenv install 3.8.10
+      pyenv global 3.8.10
       pip install -U pip
       pip install yapf
       pip install -r requirements.txt
