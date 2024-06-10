@@ -1,6 +1,6 @@
 pytest
 numpy
-torch
-dgl
+torch==1.7.0
+dgl==0.6.0
 pandas
 pydantic
