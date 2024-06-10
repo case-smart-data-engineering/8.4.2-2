@@ -1,1 +1,6 @@
 pytest
+numpy
+torch
+dgl
+pandas
+pydantic
